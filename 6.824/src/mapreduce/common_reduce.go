@@ -1,12 +1,65 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"os"
+	"io"
+	"sort"
+)
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int { return len(a) }
+func (a ByKey) Swap(i, j int)  { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
-	outFile string, // write the output here
+	outFileName string, // write the output here
 	nMap int, // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string,
 ) {
+	outFile, err := os.OpenFile(outFileName, os.O_WRONLY | os.O_CREATE, 0600)
+	if err != nil {
+		panic(err)
+	}
+	enc := json.NewEncoder(outFile)
+	defer outFile.Close()
+
+	kvMap := make(map[string][]string)
+	for i := 0; i < nMap; i++ {
+		tempFileName := reduceName(jobName, i, reduceTask)
+		tempFile, err := os.OpenFile(tempFileName, os.O_RDONLY, 0600)
+		if err != nil {
+			panic(err)
+		}
+
+		dec := json.NewDecoder(tempFile)
+		var kv KeyValue
+		for {
+			if err := dec.Decode(&kv); err == io.EOF {
+				tempFile.Close()
+				break
+			} else if err != nil {
+				panic(err)
+			}
+			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		}
+	}
+
+	// sort keys
+	var sortedKeys = make([]string, 0)
+	for k, _ := range kvMap {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+
+	// run reduceF() and output it to outFile
+	for _, key := range sortedKeys {
+		reducedValue := reduceF(key, kvMap[key])
+		enc.Encode(KeyValue{Key: key, Value: reducedValue})
+	}
 	//
 	// doReduce manages one reduce task: it should read the intermediate
 	// files for the task, sort the intermediate key/value pairs by key,
