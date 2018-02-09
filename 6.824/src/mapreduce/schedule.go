@@ -33,44 +33,44 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//
 	// Your code here (Part III, Part IV).
 	var wg sync.WaitGroup
-	// stopCh := make(chan struct{})
+	taskCh := make(chan int)
+	nCompleted := 0
 
-	TaskNumber := 0  // [0, ntasks - 1]
+	go func(){
+		for i := 0; i < ntasks; i++ {
+			taskCh <- i
+		}
+	}()
+
 	Loop:
 	for {
 		select{
-		case worker := <- registerChan:
-			if TaskNumber == ntasks {
-				// close(stopCh)
-				break Loop  // need add label because break also work in select
-			}
+		case taskNumber := <- taskCh:
+			worker := <- registerChan  // fetch a worker
+			debug("prepare to assign task %d\n", taskNumber)
 			go func(){
 				wg.Add(1)
 				defer wg.Done()
 				args := DoTaskArgs{
 					JobName: jobName,
-					File: mapFiles[TaskNumber],
+					File: mapFiles[taskNumber],
 					Phase: phase,
-					TaskNumber: TaskNumber,
+					TaskNumber: taskNumber,
 					NumOtherPhase: n_other,
 				}
-				TaskNumber++
-				call(worker, "Worker.DoTask", args, new(struct{}))
+				ok := call(worker, "Worker.DoTask", args, new(struct{}))
+				if ok {
+					nCompleted++
+				} else {
+					go func() { taskCh <- taskNumber }()
+				}
 
-				// use an additional stopCh to avoid sending to the closed RegisterCh
-				// I feel like this is a more elegant way of closing the channel,
-				// otherwise the goroutine won't exit until the end of the program
-				// select {
-				// case _, ok := <-stopCh:
-				// 	if !ok{
-				// 		return
-				// 	}
-				// case registerChan <- worker:
-				// }
-
-				// A bad(maybe?) way of queuing the working
 				go func() { registerChan <- worker }()
 			}()
+		default:
+			if nCompleted == ntasks {
+				break Loop  // need add label because break also work in select
+			}
 		}
 	}
 	wg.Wait()
