@@ -94,6 +94,7 @@ func (mr *Master) forwardRegistrations(ch chan string) {
 		} else {
 			// wait for Register() to add an entry to workers[]
 			// in response to an RPC from a new worker.
+			// Wait() atomically unlocks c.L and suspends execution of the calling goroutine
 			mr.newCond.Wait()
 		}
 		mr.Unlock()
@@ -109,6 +110,7 @@ func Distributed(jobName string, files []string, nreduce int, master string) (mr
 		func(phase jobPhase) {
 			ch := make(chan string)
 			go mr.forwardRegistrations(ch)
+			// the schedule here is the function defined in schedule.go
 			schedule(mr.jobName, mr.files, mr.nReduce, phase, ch)
 		},
 		func() {
