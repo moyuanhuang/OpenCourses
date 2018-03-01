@@ -19,11 +19,19 @@ package raft
 
 import "sync"
 import "labrpc"
+import "time"
+import "math/rand"
 
 // import "bytes"
 // import "labgob"
 
+const (
+	Leader = "Leader"
+	Candidate = "Candidate"
+	Follower = "Follower"
 
+	BroadcastIntv = 100 * time.Millisecond
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -42,6 +50,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Key int
+	Value int
+	Term int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -55,15 +69,32 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state on all servers
+	// Q: do we have to ensure "updated to stable storage before
+	// responding to RPCs?"
+	currentTerm int
+	votedFor int  // vote by servername, which is just an int
+	logs []*LogEntry
+
+	// volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// volatile state on leaders
+	nextIndex []int
+	matchIndex []int
+
+	// self added variables
+	state string
+	hasHeartbeat bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
+	term := rf.currentTerm
+	isleader := rf.state == Leader
 	return term, isleader
 }
 
@@ -115,6 +146,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -123,6 +158,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	VotersTerm int
+	VoteGranted bool
 }
 
 //
@@ -130,6 +167,43 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	grantVote := false
+	rf.updateTerm(args.Term)
+	switch rf.state {
+	case Follower:
+		if args.Term < rf.currentTerm {
+			grantVote = false
+		} else if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+			if len(rf.logs) == 0 {
+				grantVote = true
+				break
+			}
+			lastLogTerm := rf.logs[len(rf.logs) - 1].Term
+			if (lastLogTerm == args.LastLogTerm && len(rf.logs) <= args.LastLogIndex) || lastLogTerm < args.LastLogTerm {
+				grantVote = true
+			}
+		}
+	case Leader:
+		// may need extra operation since the sender might be out-dated
+	case Candidate:
+		// reject because rf has already voted for itself since it's in
+		// Candidate state
+	}
+
+	if grantVote {
+		DPrintf("Peer %d: Granted RequestVote RPC from %d.(@%s state)\n", rf.me, args.CandidateId, rf.state)
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		// reset election timeout
+		rf.hasHeartbeat = true
+	} else {
+		DPrintf("Peer %d: Rejected RequestVote RPC from %d.(@%s state)\n", rf.me, args.CandidateId, rf.state)
+		reply.VoteGranted = false
+	}
+	reply.VotersTerm = rf.currentTerm
+
+	// when deal with cluster member changes, may also need to reject Request
+	// within MINIMUM ELECTION TIMEOUT
 }
 
 //
@@ -166,6 +240,36 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+	PrevLogIndex int
+
+	PrevLogTerm int
+	Entries []*LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.updateTerm(args.Term)
+	if args.Term == rf.currentTerm && len(args.Entries) == 0 {
+		// heartbeat
+		rf.hasHeartbeat = true
+		DPrintf("Peer %d: received heartbeat from Peer %d, now at Term %d\n", rf.me, args.LeaderId, rf.currentTerm)
+	}
+	reply.Term = rf.currentTerm
+	reply.Success = true
+}
+
+func (rf *Raft) sendAppendEntriesRPC(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -214,16 +318,152 @@ func (rf *Raft) Kill() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	nPeers := len(peers)
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.logs = make([]*LogEntry, 0)
 
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.nextIndex = make([]int, nPeers)
+	rf.matchIndex = make([]int, nPeers)
+
+	rf.state = Follower
+	rf.hasHeartbeat = false
+
+	// goroutine that track leader's heartbeat
+	go func(){
+		// as stated in the paper, BroadcastTime << electionTimeOut
+		// the example value in the paper is
+		// BroadcastTime: 0.5~20 ms, electionTimeOut 150~300ms
+		// since we have BroadcastTime of 0.1s, and we need to constrain
+		// multiple rounds to be less than 5s
+		// electionTimeOut should be 1 second-ish, i.e. 0.8 ~ 1.2 s
+		rand.Seed(time.Now().UTC().UnixNano())
+		var electionTimeOut time.Duration
+		StateTransition:
+		for true {
+			electionTimeOut = (time.Duration(rand.Intn(400) + 800)) * time.Millisecond
+			if rf.state == Leader {
+				for i := 0; i < nPeers; i++{
+					if i == me {
+						continue
+					}
+					// Send AppendEntries RPC
+					go func(server int){
+						// DPrintf("Peer %d: Sending heartbeat to %d.\n", me, server)
+						args := &AppendEntriesArgs{
+							Term: rf.currentTerm,
+							LeaderId: rf.me,
+							Entries: []*LogEntry{},
+						}
+						reply := &AppendEntriesReply{}
+						rf.sendAppendEntriesRPC(server, args, reply)
+					}(i)
+				}
+				time.Sleep(BroadcastIntv)
+			} else if rf.state == Candidate {
+				rf.currentTerm++
+				rf.votedFor = me
+				voteCount := 1
+				voteCh := make(chan int)
+
+				for i := 0; i < nPeers; i++ {
+					if i == me {
+						continue
+					}
+					go func(server int){
+						lastLogIndex := len(rf.logs)
+						var lastLogTerm int
+						if lastLogIndex > 0 {
+							lastLogTerm = rf.logs[lastLogIndex - 1].Term
+						} else {
+							lastLogTerm = -1
+						}
+
+						args := &RequestVoteArgs{
+							Term: rf.currentTerm,
+							CandidateId: me,
+							LastLogIndex: lastLogIndex,
+							LastLogTerm: lastLogTerm,
+						}
+						reply := &RequestVoteReply{}
+
+						// Send RequestVote RPC
+						DPrintf("Peer %d: Sending RequestVote RPC to peer %d.\n", me, server)
+						ok := rf.sendRequestVote(server, args, reply)
+						if ok {
+							rf.updateTerm(reply.VotersTerm)
+							if reply.VoteGranted {
+								DPrintf("Peer %d: Receive grant vote from Peer %d.\n", me, server)
+								voteCh <- 1
+							}
+						} else {
+							DPrintf("Peer %d: Can't reach Peer %d, RPC returned false!\n", me, server)
+						}
+					}(i)
+				}
+
+				timeOutCh := time.After(electionTimeOut)
+				DPrintf("Peer %d(@%s state) will wait %v for votes.\n", me, rf.state, electionTimeOut)
+				voteLoop:
+				for {
+					select {
+					case <- voteCh:
+						voteCount++
+						if rf.state == Candidate && voteCount > nPeers / 2 {
+							DPrintf("Peer %d: Received majority votes, become leader now!\n", me)
+							rf.state = Leader
+							break voteLoop
+						}
+					case <- timeOutCh:
+						DPrintf("Peer %d: Election timed out.\n", me)
+						break voteLoop
+					}
+				}
+
+			} else if rf.state == Follower {
+				time.Sleep(BroadcastIntv)
+				if !rf.hasHeartbeat {
+					DPrintf("Peer %d(@%s state) hasn't receive heartbeat, will wait heartbeat for %v!\n", me, rf.state, electionTimeOut)
+					timer := time.After(electionTimeOut)
+					StartElectionTimer:
+					for {
+						select{
+						case <- timer:
+							DPrintf("Peer %d timed Out!\n", me)
+							rf.state = Candidate
+							continue StateTransition
+						default:
+							if rf.hasHeartbeat {
+								break StartElectionTimer
+							}
+						}
+					}
+				}
+				rf.hasHeartbeat = false
+			}
+		}
+	}()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 
 	return rf
+}
+func (rf *Raft) updateTerm(term int) {
+	if rf.currentTerm < term {
+		DPrintf("Peer %d(@%s state): Received AppendEntries RPC with larger term, resign to @Follower state.\n", rf.me, rf.state)
+		rf.currentTerm = term
+		rf.state = Follower
+		rf.votedFor = -1
+	}
 }
