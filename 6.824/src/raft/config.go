@@ -76,12 +76,12 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 		cfg.start1(i)
 	}
 
-	for i := 0; i < cfg.n; i++ {
-		DPrintf("size of %d-th endnames: %d. ", i, len(cfg.endnames[i]))
-		for _, name := range cfg.endnames[i] {
-			DPrintf("%s ", name)
-		}
-	}
+	// for i := 0; i < cfg.n; i++ {
+	// 	DPrintf("size of %d-th endnames: %d. ", i, len(cfg.endnames[i]))
+	// 	for _, name := range cfg.endnames[i] {
+	// 		DPrintf("%s ", name)
+	// 	}
+	// }
 
 	// connect everyone
 	for i := 0; i < cfg.n; i++ {
@@ -412,7 +412,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 	t0 := time.Now()
 	starts := 0
-	for time.Since(t0).Seconds() < 10 {
+	for time.Since(t0).Seconds() < 20 {
 		// try all the servers, maybe one is the leader.
 		index := -1
 		for si := 0; si < cfg.n; si++ {
@@ -438,6 +438,7 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				// DPrintf("Command %d on index %d: nCommitted is %d", cmd1, index, nd)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
